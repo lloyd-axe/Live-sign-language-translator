@@ -1,6 +1,10 @@
 import os
+import re
 import time
+import json
 import math
+import random
+import decimal
 import cv2 as cv
 import numpy as np
 import mediapipe as mp
@@ -12,17 +16,20 @@ The shoulder coordinates will be used as the base reference
 when normalizing the data.
 '''
 
+#remove word_list
+
 class PreprocessingPipeline:
     def __init__(self):
         self.tracker = None
         self.normalizer = None
-        self.calculator = None
+        self.augmenter = None
 
     def get_data_live(self, 
             word, 
             data_path, 
             sample_count = 15, 
-            frame_count = 18
+            frame_count = 18,
+            collect_reverse = False
             ):
         stop = False
         self.capture = cv.VideoCapture(0)
@@ -35,6 +42,9 @@ class PreprocessingPipeline:
 
         #Start collecting samples
         for sample in range(sample_count):
+            samp_path = os.path.join(data_path, word, str(sample))
+            if not os.path.isdir(samp_path):
+                os.makedirs(samp_path)
             for frame_num in range(frame_count):
                 #Have 2 seconds pause per sample
                 if frame_num == 0:
@@ -45,22 +55,26 @@ class PreprocessingPipeline:
                 #Gather key coordinates from the frame
                 results = self.tracker.detect(frame) 
                 keys = self._get_keypoints(results)
+                
                 self.tracker.draw_landmarks(frame, results, keys[0])
                 cv.imshow('Capture', frame)
+
+                #Normalize data
                 keys = self._flatten(keys)
-
-                #Augment
-
-                #Normalize
-                keys = self.normalizer.normalize_based_on_shoulders(keys)
+                #keys = self.normalizer.normalize_based_on_shoulders(keys)
 
                 #Save
-                samp_path = os.path.join(data_path, word, str(sample))
-                if not os.path.isdir(samp_path):
-                    os.makedirs(samp_path)
                 npy_path = os.path.join(samp_path, f'{frame_num}.npy')
                 np.save(npy_path, keys)
                 print(f'Saved->{npy_path}')
+
+                if collect_reverse:
+                    rev_keys = self._collect_reverse_data(frame)
+                    if not os.path.isdir(samp_path + '-r'):
+                        os.makedirs(samp_path + '-r')
+                    npy_path = os.path.join(samp_path + '-r', f'{frame_num}.npy')
+                    np.save(npy_path, rev_keys)
+                    print(f'Saved->{npy_path}')
 
                 if cv.waitKey(10) & 0xFF == ord('q'):
                     stop = True
@@ -72,14 +86,50 @@ class PreprocessingPipeline:
         cv.destroyAllWindows()
         if sample_count > 0:
             print(f'DATA GATHERED FOR {word}.')
+    
+    def load_data(self, data_path, save_json = True, augment = 0, thres = 0.02):
+        words = os.listdir(data_path)
+        words.remove('word_list.txt')
+        data = {'label_map': [], 'data': [], 'label': []}
+        data['label_map'] = words
+        for word in words:
+            word_path = os.path.join(data_path, word)
+            for sample in os.listdir(word_path):
+                sample_data = []
+                sample_path = os.path.join(word_path, sample)
+                frames = os.listdir(sample_path)
+                frames.sort(key=lambda var:[int(x) if x.isdigit() else x for x in re.findall(r'[^0-9]|[0-9]+', var)])
+                for frame in frames:
+                    frame_path = os.path.join(sample_path, frame)
+                    keys = np.load(frame_path)
+                    keys = self.normalizer.normalize_based_on_shoulders(keys)
+                    sample_data.append(keys)
+                sample_data = self.normalizer.reverse_data_shape(np.array(sample_data))
+                data['data'].append(sample_data.tolist()) 
+                data['label'].append(words.index(word))
+                for _ in range(augment):
+                    aug_data = []
+                    for frame in frames:
+                        frame_path = os.path.join(sample_path, frame)
+                        keys = np.load(frame_path)
+                        keys = self.augmenter.move_point(keys, thres = thres)
+                        keys = self.normalizer.normalize_based_on_shoulders(np.array(keys))
+                        aug_data.append(keys)
+                    aug_data = self.normalizer.reverse_data_shape(np.array(aug_data))
+                    data['data'].append(aug_data.tolist())
+                    data['label'].append(words.index(word))
+        if save_json:
+            with open(os.path.join(data_path, 'data.json'), 'w') as f:
+                json.dump(data, f, indent=4)
+                print('data.json is saved.')
+        return data
 
-    @staticmethod
-    def load_sample(sample_path):
-        sample_data = []
-        for frame_path in os.listdir(sample_path):
-            frame_file = os.path.join(sample_path, frame_path)
-            sample_data.append(np.load(frame_file))
-        return sample_data
+    def _collect_reverse_data(self, frame):
+        rev_frame = cv.flip(frame, 1)
+        results = self.tracker.detect(rev_frame) 
+        keys = self._get_keypoints(results)
+        keys = self._flatten(keys)
+        return keys
 
     def _flatten(self, keys):
         return np.concatenate([np.array(part).flatten() for part in keys]) #[6,42,42]
@@ -151,7 +201,7 @@ class Normalizer:
         #return [0 if point < 0 or point > 1 else point for point in data]
 
     def _separate_xy(self, data):
-        data = np.array(data[6:]).reshape(42,2)
+        data = np.array(data).reshape(45,2)
         x, y = [], []
         for points in data:
             x.append(points[0])
@@ -177,24 +227,22 @@ class Normalizer:
         y = (shoulder_points[0][1] + shoulder_points[1][1] + shoulder_points[2][1]) / 3
         return (x, y)
 
-class Calculator:
+    def reverse_data_shape(self, data):
+        idata = []
+        for i in range(data.shape[1]):
+            x = []
+            for j in range(data.shape[0]):
+                x.append(data[j][i])
+            idata.append(x)
+        idata = np.array(idata)
+        return idata
+
+class Augmenter:
     def __init__(self):
-        self.line_pairs = (
-            [4, 3],[3, 2],[2, 1],[1, 0],[8, 7],
-            [7, 6],[6, 5],[5, 0],[12, 11],[11, 10],
-            [10, 9],[16, 15],[15, 14],[14, 13],[20, 19],
-            [19, 18],[18, 17],[17, 0],[5, 9],[9, 13],[13, 17]
-            )
+        pass
 
-    def calculate_hand_lines(self, hand):
-        line_data = []
-        for pair in self.line_pairs:
-            x0, y0 = hand[pair[0]][0], hand[pair[0]][1]
-            x1, y1 = hand[pair[1]][0], hand[pair[1]][1]
-            line = math.hypot(x1-x0, y1-y0)
-            line_data.append(line)
-        return line_data
-
+    def move_point(self, data, thres = 0.02):
+        return [point + float(random.randrange(-thres*1000, thres*1000))/1000 for point in data]
 
 
 class Tracker:
