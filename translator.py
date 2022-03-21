@@ -1,6 +1,8 @@
 import os
+import cv2
 import numpy as np
 import matplotlib.pyplot as plt
+from keras.models import load_model
 from tensorflow.keras.models import Sequential
 from tensorflow.keras.utils import to_categorical
 from sklearn.model_selection import train_test_split
@@ -9,7 +11,47 @@ from tensorflow.keras.layers import BatchNormalization, Conv2D, Dense, Dropout, 
 
 class ASLTranslator:
     def __init__(self):
-        pass
+        self.cv = None
+        self.normalizer = None
+        self.model = None
+        self.label_map = None
+    
+    def model_load(self, model_name):
+        self.model = load_model(model_name)
+
+    def start_capture(self, 
+            frame_count = 18,
+            thresold = 0.99,
+            sentence_lim = 3,
+            text_color = (0, 255, 0)):
+        capture = cv2.VideoCapture(0)
+        sequence, sentence = [], []
+        while True:
+            frame, keys = self.cv.capture_collect(capture)
+            keys = self.normalizer.flatten(keys)
+            keys = self.normalizer.normalize_based_on_shoulders(np.array(keys))
+            sequence.append(keys)
+
+            if len(sequence) == frame_count:
+                sequence = self.normalizer.reverse_data_shape(np.array(sequence))
+                sequence = np.expand_dims(sequence, axis=0)
+                prediction = self.model.predict(sequence)[0]
+                if prediction[np.argmax(prediction)] >= thresold:
+                    word = self.label_map[np.argmax(prediction)]
+                    print(word)
+                    if sentence != []:
+                        if word != sentence[len(sentence) - 1]:
+                            sentence.append(word)
+                            sentence = sentence[1:] if len(sentence) > sentence_lim else sentence
+                    else:
+                        sentence.append(word)
+                sequence = sequence[3:].tolist()
+            self.cv.put_text(frame, ' '.join(sentence), color = text_color)
+            cv2.imshow('Capture', frame)
+            if cv2.waitKey(10) & 0xFF == ord('q'):
+                break
+        capture.release()
+        cv2.destroyAllWindows()
     
 class ModelingUtils:
     def __init__(self,
@@ -145,7 +187,3 @@ class ModelingUtils:
             self.model.add(Dense(self.filters[0]*2, activation='relu', name='dense_layer'))
         else:
             print(f'Cannot recognize {layer_type} layer.')
-
-class ModelUtils:
-    def __init__(self):
-        pass
